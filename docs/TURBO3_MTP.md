@@ -32,14 +32,14 @@ The turbo3 CUDA kernels compile with the rest — no extra flags needed.
 
 ## Launch configs
 
-### Single user — max throughput (q4_0 + MTP)
+### Single user — max throughput (q4_0 + ngram + MTP)
 
 ```bash
 ./build/bin/llama-server \
   --model /path/to/model-MTP.gguf \
   --cache-type-k q4_0 \
   --cache-type-v q4_0 \
-  --spec-type draft-mtp \
+  --spec-type ngram-mod,draft-mtp \
   --spec-draft-n-max 2 \
   --spec-draft-p-min 0.75 \
   --parallel 1 \
@@ -47,7 +47,7 @@ The turbo3 CUDA kernels compile with the rest — no extra flags needed.
   --port 8080
 ```
 
-**53.9 tok/s** generation, 91% draft acceptance, ~22.2 GB VRAM (single 3090).
+**66.9 tok/s** generation, 86% draft acceptance, ~21.9 GB VRAM (single 3090). This is the fastest config tested.
 
 ### Multi-user / long context — turbo3 + MTP
 
@@ -65,7 +65,7 @@ TURBO_AUTO_ASYMMETRIC=0 \
   --port 8080
 ```
 
-**47.4 tok/s** generation per slot, 78–95% draft acceptance, ~20.9 GB VRAM per slot. At 4 parallel slots, turbo3 saves ~5 GB vs q4_0, enabling 250K+ tokens per slot where q4_0 caps at ~140–180K.
+**37.7 tok/s** generation per slot on RTX 3090 + RTX 3060 with 4 slots, 95% draft acceptance, ~22.7 GB total VRAM. Each slot gets 65K context (`-fit` divides the total context pool across slots). Use this for concurrent serving, not single-request speed.
 
 ---
 
@@ -75,7 +75,7 @@ TURBO_AUTO_ASYMMETRIC=0 \
 |------|--------|--------|
 | `--cache-type-k` | `f16`, `q8_0`, `q4_0`, `turbo2`, `turbo3`, `turbo4` | K cache quantization |
 | `--cache-type-v` | same | V cache quantization |
-| `--spec-type` | `draft-mtp` | Enable MTP speculative decoding |
+| `--spec-type` | `draft-mtp`, `ngram-mod,draft-mtp` | Enable MTP alone or combined n-gram + MTP speculative decoding |
 | `--spec-draft-n-max` | 1–6 | Max draft tokens per verify pass |
 | `--spec-draft-p-min` | 0.0–1.0 | Min probability threshold to accept a draft token |
 | `-fit` | flag | Auto-size n_ctx to fill available VRAM |
@@ -103,8 +103,22 @@ TURBO_AUTO_ASYMMETRIC=0 \
 |---|---|---|---|---|---|
 | q4_0, no MTP | 262,144 | 20.8 GB | 36.5 | 187.8 | — |
 | turbo3, no MTP | 262,144 | 19.6 GB | 35.8 | 178.2 | — |
-| q4_0 + MTP | 262,144 | 22.2 GB | **53.9** | 149.4 | 91% |
-| turbo3 + MTP | 262,144 | 20.9 GB | 47.4 | 155.6 | 78% |
+| q4_0 + MTP n-max 2 | 262,144 | 22.2 GB | 53.9 | 149.4 | 91% |
+| turbo3 + MTP n-max 1 | 262,144 | 20.9 GB | 48.2 | 162.9 | 95% |
+| **q4_0 + ngram-mod + MTP** | **262,144** | **21.9 GB** | **66.9** | 158.3 | **86%** |
+| k=q8_0, v=turbo3 + MTP n-max 1 | 262,144 | 23.4 GB | 47.0 | 174.9 | 86% |
+
+### Multi-GPU (RTX 3090 + RTX 3060, 4 parallel slots, turbo3+MTP n-max 1)
+
+| Metric | Value |
+|---|---|
+| VRAM GPU0 (3090) | 13.8 GB |
+| VRAM GPU1 (3060) | 8.9 GB |
+| ctx / slot | 65,536 (4 slots × 65K = 262K total) |
+| gen tok/s | 37.7 |
+| MTP accept | 95% |
+
+Speed penalty from inter-GPU communication: ~22% vs single-GPU. Use for concurrency (4 simultaneous users), not single-request speed.
 
 ---
 
@@ -112,7 +126,7 @@ TURBO_AUTO_ASYMMETRIC=0 \
 
 **TURBO_AUTO_ASYMMETRIC** (default: on): when the model's GQA ratio hits 6:1 (e.g. Qwen3.6-27B: 24Q/4KV), K is silently upgraded from turbo3 → q8_0. This preserves attention quality at the cost of losing most VRAM savings. Set `TURBO_AUTO_ASYMMETRIC=0` to disable and keep full turbo3 on both K and V.
 
-**-fit with turbo3 + multiple GPUs**: `-fit` computes context against total VRAM across all GPUs. With 2 GPUs (36 GB), turbo3 at 4 slots will allocate 250K+ context per slot — but some of that may spill to the second GPU. Use `CUDA_VISIBLE_DEVICES=0` to constrain to one GPU if you want single-GPU performance numbers.
+**-fit with turbo3 + multiple GPUs**: `-fit` computes one total context pool and divides it across slots. With 4 slots in the tested RTX 3090 + RTX 3060 setup, turbo3 loaded cleanly at 65K tokens per slot (262K total), using 13.8 GB on the 3090 and 8.9 GB on the 3060. Use `CUDA_VISIBLE_DEVICES=0` to constrain to one GPU if you want single-GPU performance numbers.
 
 **MTP draft context inherits KV types**: the MTP draft context uses the same `--cache-type-k/v` settings as the main context. Both contexts are allocated; budget accordingly (~1.4 GB extra for MTP draft at 262K).
 
@@ -122,8 +136,10 @@ TURBO_AUTO_ASYMMETRIC=0 \
 
 ---
 
-## Untested
+## Tested configs — findings
 
-- `--cache-type-k q8_0 --cache-type-v turbo3` — high-quality K + compressed V. Should recover MTP acceptance toward 91% while saving ~0.6 GB per slot vs full q4_0. Not benchmarked.
-- `--spec-type ngram-mod,draft-mtp` — combined ngram + MTP speculation. Supported by the spec framework but not benchmarked with turbo3.
-- Multi-GPU turbo3 at 4 slots targeting 262K per slot with `TURBO_AUTO_ASYMMETRIC=0`.
+**`--spec-type ngram-mod,draft-mtp` is the single-GPU speed champion.** 66.9 tok/s vs 53.9 for MTP alone — a 24% gain. ngram-mod drafts from the token n-gram cache for repetitive segments; MTP covers the rest. Combined, more draft tokens are generated per verify pass (259 vs 230) at 86% acceptance. Same VRAM as q4_0+MTP. Add `--spec-type ngram-mod,draft-mtp` to the q4_0 launch config above.
+
+**`--cache-type-k q8_0 --cache-type-v turbo3` is not worth it.** Expected to recover acceptance toward 91% (high-quality K) while saving VRAM vs full q4_0. Reality: acceptance at n-max 2 is 79.6% (barely better than turbo3+turbo3 at 78%), and it costs +3 GB VRAM vs full turbo3 — making it strictly worse than both alternatives. The V=turbo3 compression is what hurts acceptance; K quality doesn't compensate.
+
+**Multi-GPU 4-slot turbo3 loads cleanly and hits 95% acceptance.** The 22% speed penalty vs single-GPU is from PCIe inter-GPU traffic. Total context across 4 slots is 262K (65K per slot), not 262K per slot — `-fit` divides the pool. For maximizing total throughput across concurrent users, multi-GPU still wins over single-slot: 4 × 37.7 = 150.8 effective tok/s system-wide.
