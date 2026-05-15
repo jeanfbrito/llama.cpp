@@ -324,6 +324,28 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
+
     GGML_ABORT("fatal error");
 }
 
@@ -421,8 +443,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+    {
+        const bool k_is_turbo = (K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO4_0);
+        const bool v_is_turbo = (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO4_0);
+        // Turbo types are always enabled even without GGML_CUDA_FA_ALL_QUANTS.
+        // Allow mixed turbo/f16, turbo/q8_0, and turbo/turbo KV configs.
+        auto is_kv_compat = [&](ggml_type t) {
+            return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+                   t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        if ((k_is_turbo || v_is_turbo)) {
+            if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        } else if (K->type != V->type) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
@@ -439,6 +475,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+            break;
+        case GGML_TYPE_TURBO3_0:
+            // turbo3 VEC kernel instantiated for D in {64, 128, 256}.
+            if (K->ne[0] % 64 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case GGML_TYPE_TURBO2_0:
+            // turbo2 VEC kernel instantiated for D in {64, 128, 256}.
+            if (K->ne[0] % 64 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            break;
+        case GGML_TYPE_TURBO4_0:
+            // turbo4 VEC kernel instantiated for D in {64, 128, 256}.
+            if (K->ne[0] % 64 != 0) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -465,7 +519,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    if (Q->ne[1] == 1) {
+                    // Turbo types have no fp16 converter; MMA would dereference a null function pointer.
+                    const bool kv_is_turbo = K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO4_0 ||
+                                             V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO4_0;
+                    if (Q->ne[1] == 1 || kv_is_turbo) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
